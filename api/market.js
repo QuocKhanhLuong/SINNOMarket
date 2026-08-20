@@ -1,5 +1,15 @@
 import { db, json } from '../lib/db.js';
 
+const RATE_CEILING = 0.95;
+const RATE_FLOOR = 0.08;
+const RATE_LIQUIDITY = 5000;
+
+function bookmakerRate(userPool) {
+  const volume = Math.max(0, Number(userPool || 0));
+  const raw = RATE_CEILING / (1 + volume / RATE_LIQUIDITY);
+  return Math.max(RATE_FLOOR, Math.min(RATE_CEILING, raw));
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
 
@@ -66,17 +76,17 @@ export default async function handler(req, res) {
     const totalPool = candidates.reduce((sum, candidate) => sum + Number(candidate.pool), 0);
     const markets = candidates.map((candidate) => {
       const pool = Number(candidate.pool);
+      const userPool = Number(candidate.user_pool);
       const probability = totalPool ? pool / totalPool : 0;
-      const decimalOdds = pool ? totalPool / pool : 0;
-      const rate = Math.max(0, decimalOdds - 1);
+      const rate = bookmakerRate(userPool);
       return {
         ...candidate,
         pool,
-        user_pool: Number(candidate.user_pool),
+        user_pool: userPool,
         bet_count: Number(candidate.bet_count),
         probability,
         rate,
-        decimalOdds,
+        decimalOdds: 1 + rate,
         odds: rate,
       };
     });
@@ -92,6 +102,12 @@ export default async function handler(req, res) {
       players: Number(stats?.players || 0),
       volume60m: Number(stats?.volume_60m || 0),
       trades60m: Number(stats?.trades_60m || 0),
+      rateModel: {
+        type: 'bookmaker-dynamic',
+        ceiling: RATE_CEILING,
+        floor: RATE_FLOOR,
+        liquidity: RATE_LIQUIDITY,
+      },
       markets,
       hourly,
       activity: activity.map((item) => ({ ...item, bettor: 'Anonymous' })),
