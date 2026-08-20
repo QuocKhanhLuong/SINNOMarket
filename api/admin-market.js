@@ -103,14 +103,17 @@ export default async function handler(req, res) {
     const markets = candidates.map((candidate) => {
       const pool = Number(candidate.pool);
       const probability = totalPool ? pool / totalPool : 0;
-      const odds = pool ? totalPool / pool : 0;
+      const decimalOdds = pool ? totalPool / pool : 0;
+      const rate = Math.max(0, decimalOdds - 1);
       return {
         ...candidate,
         pool,
         user_pool: Number(candidate.user_pool),
         bet_count: Number(candidate.bet_count),
         probability,
-        odds,
+        rate,
+        decimalOdds,
+        odds: rate,
       };
     });
 
