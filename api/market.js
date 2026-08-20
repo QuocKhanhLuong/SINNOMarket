@@ -1,14 +1,5 @@
 import { db, json } from '../lib/db.js';
-
-const RATE_CEILING = 0.95;
-const RATE_FLOOR = 0.08;
-const RATE_LIQUIDITY = 5000;
-
-function bookmakerRate(userPool) {
-  const volume = Math.max(0, Number(userPool || 0));
-  const raw = RATE_CEILING / (1 + volume / RATE_LIQUIDITY);
-  return Math.max(RATE_FLOOR, Math.min(RATE_CEILING, raw));
-}
+import { HOUSE_EDGE, MAX_DECIMAL_ODDS, MIN_DECIMAL_ODDS, marketQuote } from '../lib/odds.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
@@ -53,6 +44,7 @@ export default async function handler(req, res) {
         b.id,
         b.stake,
         b.created_at,
+        b.odds_at_bet,
         c.id AS candidate_id,
         c.name AS candidate_name,
         c.initials
@@ -77,17 +69,18 @@ export default async function handler(req, res) {
     const markets = candidates.map((candidate) => {
       const pool = Number(candidate.pool);
       const userPool = Number(candidate.user_pool);
-      const probability = totalPool ? pool / totalPool : 0;
-      const rate = bookmakerRate(userPool);
+      const quote = marketQuote(pool, totalPool);
       return {
         ...candidate,
+        seed_pool: Number(candidate.seed_pool),
         pool,
         user_pool: userPool,
         bet_count: Number(candidate.bet_count),
-        probability,
-        rate,
-        decimalOdds: 1 + rate,
-        odds: rate,
+        probability: quote.share,
+        share: quote.share,
+        decimalOdds: quote.decimalOdds,
+        odds: quote.decimalOdds,
+        profitMultiplier: quote.profitMultiplier,
       };
     });
 
@@ -103,14 +96,18 @@ export default async function handler(req, res) {
       volume60m: Number(stats?.volume_60m || 0),
       trades60m: Number(stats?.trades_60m || 0),
       rateModel: {
-        type: 'bookmaker-dynamic',
-        ceiling: RATE_CEILING,
-        floor: RATE_FLOOR,
-        liquidity: RATE_LIQUIDITY,
+        type: 'share-bookmaker',
+        houseEdge: HOUSE_EDGE,
+        minDecimalOdds: MIN_DECIMAL_ODDS,
+        maxDecimalOdds: MAX_DECIMAL_ODDS,
       },
       markets,
       hourly,
-      activity: activity.map((item) => ({ ...item, bettor: 'Anonymous' })),
+      activity: activity.map((item) => ({
+        ...item,
+        odds_at_bet: item.odds_at_bet == null ? null : Number(item.odds_at_bet),
+        bettor: 'Anonymous',
+      })),
     });
   } catch (error) {
     console.error(error);
