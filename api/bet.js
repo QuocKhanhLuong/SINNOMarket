@@ -1,5 +1,5 @@
 import { db, json } from '../lib/db.js';
-import { marketQuote } from '../lib/odds.js';
+import { marketQuote, splitStake } from '../lib/odds.js';
 
 const DAILY_GRANT = 10000;
 
@@ -23,18 +23,26 @@ async function currentQuote(sql, candidateId) {
   const pools = await sql`
     SELECT
       c.id,
-      (c.seed_pool + COALESCE(SUM(b.stake), 0))::int AS pool
+      c.seed_pool,
+      c.admin_weight,
+      COALESCE(SUM(b.effective_stake), 0)::int AS effective_pool
     FROM candidates c
     LEFT JOIN bets b ON b.candidate_id = c.id
-    GROUP BY c.id, c.seed_pool
+    GROUP BY c.id, c.seed_pool, c.admin_weight
   `;
 
-  const totalPool = pools.reduce((sum, row) => sum + Number(row.pool), 0);
+  const totalEffectivePool = pools.reduce((sum, row) => sum + Number(row.effective_pool), 0);
   const candidate = pools.find((row) => row.id === candidateId);
   if (!candidate) return null;
 
-  const quote = marketQuote(Number(candidate.pool), totalPool);
-  return { ...quote, totalPool, candidatePool: Number(candidate.pool) };
+  const pricingWeight = Number(candidate.seed_pool || 0) + Number(candidate.admin_weight || 0);
+  const quote = marketQuote(Number(candidate.effective_pool), totalEffectivePool, pricingWeight);
+  return {
+    ...quote,
+    totalEffectivePool,
+    candidateEffectivePool: Number(candidate.effective_pool),
+    pricingWeight,
+  };
 }
 
 export default async function handler(req, res) {
@@ -54,7 +62,8 @@ export default async function handler(req, res) {
     const quote = await currentQuote(sql, candidateId);
     if (!quote) return json(res, 404, { error: 'Candidate not found' });
 
-    const lockedOdds = Number(quote.decimalOdds.toFixed(4));
+    const { effectiveStake, feeAmount } = splitStake(stake);
+    const quoteSnapshot = Number(quote.decimalOdds.toFixed(4));
 
     const inserted = await sql`
       WITH charged AS (
@@ -69,11 +78,18 @@ export default async function handler(req, res) {
           )
         RETURNING id
       )
-      INSERT INTO bets (player_id, candidate_id, stake, odds_at_bet)
-      SELECT charged.id, c.id, ${stake}, ${lockedOdds}
+      INSERT INTO bets (
+        player_id,
+        candidate_id,
+        stake,
+        effective_stake,
+        fee_amount,
+        odds_at_bet
+      )
+      SELECT charged.id, c.id, ${stake}, ${effectiveStake}, ${feeAmount}, ${quoteSnapshot}
       FROM charged
       JOIN candidates c ON c.id = ${candidateId}
-      RETURNING id, created_at, odds_at_bet
+      RETURNING id, created_at, odds_at_bet, stake, effective_stake, fee_amount
     `;
 
     if (!inserted.length) {
@@ -84,7 +100,6 @@ export default async function handler(req, res) {
 
       const [player] = await sql`SELECT starting_balance, spent FROM players WHERE id = ${playerId}`;
       if (!player) return json(res, 404, { error: 'Player not found' });
-
       return json(res, 409, { error: 'Not enough points remaining' });
     }
 
@@ -102,13 +117,23 @@ export default async function handler(req, res) {
 
     const bet = {
       ...inserted[0],
+      stake: Number(inserted[0].stake),
+      effective_stake: Number(inserted[0].effective_stake),
+      fee_amount: Number(inserted[0].fee_amount),
       odds_at_bet: Number(inserted[0].odds_at_bet),
-      stake,
-      estimated_return: Math.round(stake * lockedOdds),
-      estimated_profit: Math.round(stake * (lockedOdds - 1)),
+      quote_snapshot_return: Math.round(effectiveStake * quoteSnapshot),
+      quote_snapshot_net: Math.round(effectiveStake * quoteSnapshot - stake),
     };
 
-    return json(res, 201, { ok: true, bet, player });
+    return json(res, 201, {
+      ok: true,
+      bet,
+      player,
+      settlement: {
+        mode: 'final-pool',
+        note: 'Quote snapshot is for audit only. Final payout uses the market quote at close.',
+      },
+    });
   } catch (error) {
     console.error(error);
     return json(res, 500, { error: 'Unable to place bet' });
