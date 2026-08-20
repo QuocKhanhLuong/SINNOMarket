@@ -4,6 +4,7 @@ import { db, json } from '../lib/db.js';
 const RATE_CEILING = 0.95;
 const RATE_FLOOR = 0.08;
 const RATE_LIQUIDITY = 5000;
+const DAILY_GRANT = 10000;
 
 function bookmakerRate(userPool) {
   const volume = Math.max(0, Number(userPool || 0));
@@ -88,37 +89,42 @@ export default async function handler(req, res) {
         p.nickname,
         COUNT(b.id)::int AS bet_count,
         COALESCE(SUM(b.stake), 0)::int AS total_stake,
-        (p.starting_balance - p.spent)::int AS balance,
-        MAX(b.created_at) AS last_bet_at
+        (
+          GREATEST(
+            p.starting_balance,
+            ${DAILY_GRANT} * (
+              1 + GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - p.created_at)) / 86400)::int)
+            )
+          ) - p.spent
+        )::int AS balance,
+        MAX(b.created_at) AS last_bet_at,
+        (
+          p.created_at +
+          ((GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - p.created_at)) / 86400)) + 1) * interval '1 day')
+        ) AS next_refill_at
       FROM players p
       LEFT JOIN bets b ON b.player_id = p.id
-      GROUP BY p.id, p.nickname, p.starting_balance, p.spent
+      GROUP BY p.id, p.nickname, p.starting_balance, p.spent, p.created_at
       HAVING COUNT(b.id) > 0
       ORDER BY total_stake DESC, last_bet_at DESC
       LIMIT 100
     `;
 
-    const hourly = await sql`
-      SELECT
-        date_trunc('hour', created_at) AS bucket,
-        COALESCE(SUM(stake), 0)::int AS volume,
-        COUNT(*)::int AS trades
-      FROM bets
-      WHERE created_at >= now() - interval '12 hours'
-      GROUP BY 1
-      ORDER BY 1 ASC
-    `;
-
     const totalPool = candidates.reduce((sum, candidate) => sum + Number(candidate.pool), 0);
+    const adminLiquidity = candidates.reduce((sum, candidate) => sum + Number(candidate.seed_pool), 0);
     const markets = candidates.map((candidate) => {
       const pool = Number(candidate.pool);
       const userPool = Number(candidate.user_pool);
+      const seedPool = Number(candidate.seed_pool);
       const probability = totalPool ? pool / totalPool : 0;
       const rate = bookmakerRate(userPool);
       return {
         ...candidate,
+        seed_pool: seedPool,
+        admin_liquidity: seedPool,
         pool,
         user_pool: userPool,
+        user_volume: userPool,
         bet_count: Number(candidate.bet_count),
         probability,
         rate,
@@ -133,11 +139,13 @@ export default async function handler(req, res) {
       serverNow: config?.server_now,
       open: config ? new Date(config.server_now) < new Date(config.close_at) : false,
       totalPool,
+      adminLiquidity,
       volume: Number(stats?.volume || 0),
       trades: Number(stats?.trades || 0),
       players: Number(stats?.players || 0),
       volume60m: Number(stats?.volume_60m || 0),
       trades60m: Number(stats?.trades_60m || 0),
+      dailyGrant: DAILY_GRANT,
       rateModel: {
         type: 'bookmaker-dynamic',
         ceiling: RATE_CEILING,
@@ -145,7 +153,6 @@ export default async function handler(req, res) {
         liquidity: RATE_LIQUIDITY,
       },
       markets,
-      hourly,
       activity,
       bettors,
     });
