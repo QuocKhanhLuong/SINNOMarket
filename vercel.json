@@ -2,6 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/", "destination": "/market-rate.html" },
-    { "source": "/rate-control", "destination": "/rate-admin.html" }
+    { "source": "/rate-control", "destination": "/dashboard.html" }
   ]
 }
