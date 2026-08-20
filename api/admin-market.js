@@ -1,16 +1,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import { db, json } from '../lib/db.js';
+import { HOUSE_EDGE, MAX_DECIMAL_ODDS, MIN_DECIMAL_ODDS, marketQuote } from '../lib/odds.js';
 
-const RATE_CEILING = 0.95;
-const RATE_FLOOR = 0.08;
-const RATE_LIQUIDITY = 5000;
 const DAILY_GRANT = 10000;
-
-function bookmakerRate(userPool) {
-  const volume = Math.max(0, Number(userPool || 0));
-  const raw = RATE_CEILING / (1 + volume / RATE_LIQUIDITY);
-  return Math.max(RATE_FLOOR, Math.min(RATE_CEILING, raw));
-}
 
 function authorized(req) {
   const expected = String(process.env.ADMIN_KEY || '').trim();
@@ -64,7 +56,9 @@ export default async function handler(req, res) {
         COUNT(*)::int AS trades,
         COUNT(DISTINCT player_id)::int AS players,
         COALESCE(SUM(stake) FILTER (WHERE created_at >= now() - interval '60 minutes'), 0)::int AS volume_60m,
-        COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes')::int AS trades_60m
+        COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes')::int AS trades_60m,
+        COUNT(*) FILTER (WHERE odds_at_bet IS NULL)::int AS legacy_bets,
+        COALESCE(SUM(stake) FILTER (WHERE odds_at_bet IS NULL), 0)::int AS legacy_stake
       FROM bets
     `;
 
@@ -73,6 +67,7 @@ export default async function handler(req, res) {
         b.id,
         b.stake,
         b.created_at,
+        b.odds_at_bet,
         p.nickname,
         c.id AS candidate_id,
         c.name AS candidate_name,
@@ -86,6 +81,7 @@ export default async function handler(req, res) {
 
     const bettors = await sql`
       SELECT
+        p.id,
         p.nickname,
         COUNT(b.id)::int AS bet_count,
         COALESCE(SUM(b.stake), 0)::int AS total_stake,
@@ -110,14 +106,30 @@ export default async function handler(req, res) {
       LIMIT 100
     `;
 
+    const settlementRows = await sql`
+      SELECT
+        b.candidate_id,
+        p.id AS player_id,
+        p.nickname,
+        COUNT(*)::int AS bet_count,
+        COALESCE(SUM(b.stake), 0)::int AS stake,
+        COUNT(*) FILTER (WHERE b.odds_at_bet IS NULL)::int AS legacy_bets,
+        COALESCE(SUM(b.stake) FILTER (WHERE b.odds_at_bet IS NULL), 0)::int AS legacy_stake,
+        COALESCE(SUM(b.stake * b.odds_at_bet) FILTER (WHERE b.odds_at_bet IS NOT NULL), 0)::numeric AS locked_payout
+      FROM bets b
+      JOIN players p ON p.id = b.player_id
+      GROUP BY b.candidate_id, p.id, p.nickname
+    `;
+
     const totalPool = candidates.reduce((sum, candidate) => sum + Number(candidate.pool), 0);
     const adminLiquidity = candidates.reduce((sum, candidate) => sum + Number(candidate.seed_pool), 0);
+    const totalUserVolume = Number(stats?.volume || 0);
+
     const markets = candidates.map((candidate) => {
       const pool = Number(candidate.pool);
       const userPool = Number(candidate.user_pool);
       const seedPool = Number(candidate.seed_pool);
-      const probability = totalPool ? pool / totalPool : 0;
-      const rate = bookmakerRate(userPool);
+      const quote = marketQuote(pool, totalPool);
       return {
         ...candidate,
         seed_pool: seedPool,
@@ -126,12 +138,59 @@ export default async function handler(req, res) {
         user_pool: userPool,
         user_volume: userPool,
         bet_count: Number(candidate.bet_count),
-        probability,
-        rate,
-        decimalOdds: 1 + rate,
-        odds: rate,
+        probability: quote.share,
+        share: quote.share,
+        decimalOdds: quote.decimalOdds,
+        odds: quote.decimalOdds,
+        profitMultiplier: quote.profitMultiplier,
       };
     });
+
+    const marketById = new Map(markets.map((item) => [item.id, item]));
+    const settlement = markets.map((candidate) => {
+      const rows = settlementRows.filter((row) => row.candidate_id === candidate.id);
+      const players = rows.map((row) => {
+        const stake = Number(row.stake || 0);
+        const legacyStake = Number(row.legacy_stake || 0);
+        const lockedPayout = Number(row.locked_payout || 0);
+        const estimatedLegacyPayout = legacyStake * candidate.decimalOdds;
+        const payout = lockedPayout + estimatedLegacyPayout;
+        return {
+          playerId: row.player_id,
+          nickname: row.nickname,
+          betCount: Number(row.bet_count || 0),
+          legacyBets: Number(row.legacy_bets || 0),
+          stake,
+          lockedPayout,
+          estimatedLegacyPayout,
+          payout,
+          profit: payout - stake,
+        };
+      });
+
+      const payoutLiability = players.reduce((sum, player) => sum + player.payout, 0);
+      const winningStake = players.reduce((sum, player) => sum + player.stake, 0);
+      const biggestWinner = [...players].sort((a, b) => b.payout - a.payout)[0] || null;
+
+      return {
+        candidateId: candidate.id,
+        candidateName: candidate.name,
+        share: candidate.share,
+        currentOdds: candidate.decimalOdds,
+        winningStake,
+        payoutLiability,
+        housePL: totalUserVolume - payoutLiability,
+        biggestWinner,
+        legacyEstimated: players.some((player) => player.legacyBets > 0),
+      };
+    });
+
+    const currentLeader = [...markets].sort((a, b) => b.share - a.share)[0] || null;
+    const leaderSettlement = currentLeader
+      ? settlement.find((row) => row.candidateId === currentLeader.id) || null
+      : null;
+    const worstCase = [...settlement].sort((a, b) => a.housePL - b.housePL)[0] || null;
+    const bestCase = [...settlement].sort((a, b) => b.housePL - a.housePL)[0] || null;
 
     return json(res, 200, {
       title: config?.title || 'Who will be the next President of SINNO?',
@@ -140,20 +199,29 @@ export default async function handler(req, res) {
       open: config ? new Date(config.server_now) < new Date(config.close_at) : false,
       totalPool,
       adminLiquidity,
-      volume: Number(stats?.volume || 0),
+      volume: totalUserVolume,
       trades: Number(stats?.trades || 0),
       players: Number(stats?.players || 0),
       volume60m: Number(stats?.volume_60m || 0),
       trades60m: Number(stats?.trades_60m || 0),
+      legacyBets: Number(stats?.legacy_bets || 0),
+      legacyStake: Number(stats?.legacy_stake || 0),
       dailyGrant: DAILY_GRANT,
       rateModel: {
-        type: 'bookmaker-dynamic',
-        ceiling: RATE_CEILING,
-        floor: RATE_FLOOR,
-        liquidity: RATE_LIQUIDITY,
+        type: 'share-bookmaker',
+        houseEdge: HOUSE_EDGE,
+        minDecimalOdds: MIN_DECIMAL_ODDS,
+        maxDecimalOdds: MAX_DECIMAL_ODDS,
       },
       markets,
-      activity,
+      settlement,
+      leaderSettlement,
+      worstCase,
+      bestCase,
+      activity: activity.map((item) => ({
+        ...item,
+        odds_at_bet: item.odds_at_bet == null ? null : Number(item.odds_at_bet),
+      })),
       bettors,
     });
   } catch (error) {
