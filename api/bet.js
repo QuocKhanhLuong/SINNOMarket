@@ -1,5 +1,23 @@
 import { db, json } from '../lib/db.js';
 
+const DAILY_GRANT = 10000;
+
+async function applyDailyRefill(sql, playerId) {
+  await sql`
+    UPDATE players
+    SET starting_balance = GREATEST(
+      starting_balance,
+      ${DAILY_GRANT} * (
+        1 + GREATEST(
+          0,
+          FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 86400)::int
+        )
+      )
+    )
+    WHERE id = ${playerId}
+  `;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
 
@@ -12,6 +30,7 @@ export default async function handler(req, res) {
 
   try {
     const sql = db();
+    await applyDailyRefill(sql, playerId);
 
     const inserted = await sql`
       WITH charged AS (
@@ -50,7 +69,12 @@ export default async function handler(req, res) {
 
     const [player] = await sql`
       SELECT id, nickname, starting_balance, spent,
-             (starting_balance - spent)::int AS balance
+             (starting_balance - spent)::int AS balance,
+             ${DAILY_GRANT}::int AS daily_grant,
+             (
+               created_at +
+               ((GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 86400)) + 1) * interval '1 day')
+             ) AS next_refill_at
       FROM players
       WHERE id = ${playerId}
     `;
