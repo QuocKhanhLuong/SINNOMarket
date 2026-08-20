@@ -1,6 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { db, json } from '../lib/db.js';
-import { HOUSE_EDGE, MAX_DECIMAL_ODDS, MIN_DECIMAL_ODDS, marketQuote } from '../lib/odds.js';
+import { marketQuote } from '../lib/odds.js';
 
 const DAILY_GRANT = 10000;
 
@@ -146,7 +146,6 @@ export default async function handler(req, res) {
       };
     });
 
-    const marketById = new Map(markets.map((item) => [item.id, item]));
     const settlement = markets.map((candidate) => {
       const rows = settlementRows.filter((row) => row.candidate_id === candidate.id);
       const players = rows.map((row) => {
@@ -208,10 +207,8 @@ export default async function handler(req, res) {
       legacyStake: Number(stats?.legacy_stake || 0),
       dailyGrant: DAILY_GRANT,
       rateModel: {
-        type: 'share-bookmaker',
-        houseEdge: HOUSE_EDGE,
-        minDecimalOdds: MIN_DECIMAL_ODDS,
-        maxDecimalOdds: MAX_DECIMAL_ODDS,
+        type: 'uncapped-pool-ratio',
+        formula: 'totalPool / candidatePool',
       },
       markets,
       settlement,
