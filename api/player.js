@@ -37,7 +37,9 @@ export default async function handler(req, res) {
 
     return json(res, 405, { error: 'Method not allowed' });
   } catch (error) {
-    console.error(error);
-    return json(res, 400, { error: error.message || 'Unable to save player' });
+    console.error('player api error', error);
+    const message = error?.message || 'Unable to save player';
+    const status = message.includes('Database is not connected') ? 503 : 400;
+    return json(res, status, { error: message });
   }
 }
