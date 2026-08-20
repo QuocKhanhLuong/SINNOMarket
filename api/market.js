@@ -29,7 +29,12 @@ export default async function handler(req, res) {
     `;
 
     const [stats] = await sql`
-      SELECT COALESCE(SUM(stake), 0)::int AS volume, COUNT(*)::int AS trades
+      SELECT
+        COALESCE(SUM(stake), 0)::int AS volume,
+        COUNT(*)::int AS trades,
+        COUNT(DISTINCT player_id)::int AS players,
+        COALESCE(SUM(stake) FILTER (WHERE created_at >= now() - interval '60 minutes'), 0)::int AS volume_60m,
+        COUNT(*) FILTER (WHERE created_at >= now() - interval '60 minutes')::int AS trades_60m
       FROM bets
     `;
 
@@ -38,15 +43,24 @@ export default async function handler(req, res) {
         b.id,
         b.stake,
         b.created_at,
-        p.nickname,
         c.id AS candidate_id,
         c.name AS candidate_name,
         c.initials
       FROM bets b
-      JOIN players p ON p.id = b.player_id
       JOIN candidates c ON c.id = b.candidate_id
       ORDER BY b.created_at DESC
-      LIMIT 40
+      LIMIT 50
+    `;
+
+    const hourly = await sql`
+      SELECT
+        date_trunc('hour', created_at) AS bucket,
+        COALESCE(SUM(stake), 0)::int AS volume,
+        COUNT(*)::int AS trades
+      FROM bets
+      WHERE created_at >= now() - interval '12 hours'
+      GROUP BY 1
+      ORDER BY 1 ASC
     `;
 
     const totalPool = candidates.reduce((sum, candidate) => sum + Number(candidate.pool), 0);
@@ -72,8 +86,12 @@ export default async function handler(req, res) {
       totalPool,
       volume: Number(stats?.volume || 0),
       trades: Number(stats?.trades || 0),
+      players: Number(stats?.players || 0),
+      volume60m: Number(stats?.volume_60m || 0),
+      trades60m: Number(stats?.trades_60m || 0),
       markets,
-      activity,
+      hourly,
+      activity: activity.map((item) => ({ ...item, bettor: 'Anonymous' })),
     });
   } catch (error) {
     console.error(error);
