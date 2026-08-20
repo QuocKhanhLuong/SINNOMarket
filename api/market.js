@@ -1,5 +1,5 @@
 import { db, json } from '../lib/db.js';
-import { HOUSE_EDGE, MAX_DECIMAL_ODDS, MIN_DECIMAL_ODDS, marketQuote } from '../lib/odds.js';
+import { marketQuote } from '../lib/odds.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
@@ -96,10 +96,8 @@ export default async function handler(req, res) {
       volume60m: Number(stats?.volume_60m || 0),
       trades60m: Number(stats?.trades_60m || 0),
       rateModel: {
-        type: 'share-bookmaker',
-        houseEdge: HOUSE_EDGE,
-        minDecimalOdds: MIN_DECIMAL_ODDS,
-        maxDecimalOdds: MAX_DECIMAL_ODDS,
+        type: 'uncapped-pool-ratio',
+        formula: 'totalPool / candidatePool',
       },
       markets,
       hourly,
